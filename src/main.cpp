@@ -8,6 +8,7 @@
 #include <U8g2_for_TFT_eSPI.h>
 #include <time.h>
 #include <esp_netif.h>
+#include <esp_wifi.h>
 
 // Target: ESP32-2432S028 CYD, matching the working NerdMiner ILI9341_2 setup.
 // The display is driven by TFT_eSPI; touch is not needed for this dashboard.
@@ -141,6 +142,16 @@ void showMessage(const String &title, const String &line1, const String &line2 =
   if (line2.length()) drawUtf8Centered(line2, 160, 142, TFT_WHITE);
 }
 
+void configureFastWifi() {
+  // Prefer HT40 on both interfaces. Keep the default B/G/N protocol set so
+  // legacy clients and upstream routers remain compatible.
+  const esp_err_t staBandwidth = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+  const esp_err_t apBandwidth = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT40);
+  Serial.printf("Wi-Fi performance: STA HT40=%s AP HT40=%s\n",
+    esp_err_to_name(staBandwidth),
+    esp_err_to_name(apBandwidth));
+}
+
 void startPortal() {
   portalMode = true;
   WiFi.mode(WIFI_AP_STA);
@@ -149,6 +160,7 @@ void startPortal() {
   snprintf(suffix, sizeof(suffix), "%04X", static_cast<unsigned>(id & 0xFFFF));
   if (apName.isEmpty()) apName = String("CYD-Weather-") + suffix;
   WiFi.softAP(apName.c_str(), apPassword.c_str());
+  configureFastWifi();
   const IPAddress ip = WiFi.softAPIP();
   showMessage("Настройка Wi-Fi", apName, String("Пароль: ") + apPassword);
   Serial.printf("Setup AP: %s  password: %s  open http://%s\n", apName.c_str(), apPassword.c_str(), ip.toString().c_str());
@@ -161,6 +173,7 @@ void startSettingsAP() {
   if (apName.isEmpty()) apName = String("CYD-Weather-") + suffix;
   WiFi.mode(WIFI_AP_STA);
   const bool ok = WiFi.softAP(apName.c_str(), apPassword.c_str());
+  if (ok) configureFastWifi();
   esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
   if (ok && ap) {
     // Stop DHCP while changing its DNS offer so clients receive a public DNS
