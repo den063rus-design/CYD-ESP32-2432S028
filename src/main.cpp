@@ -9,6 +9,7 @@
 #include <time.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
+#include <WiFiClientSecure.h>
 
 // Target: ESP32-2432S028 CYD, matching the working NerdMiner ILI9341_2 setup.
 // The display is driven by TFT_eSPI; touch is not needed for this dashboard.
@@ -31,6 +32,10 @@ String resolvedTimezone;
 String apName;
 static constexpr char SETTINGS_AP_PASSWORD[] = "cydweather";
 String apPassword = SETTINGS_AP_PASSWORD;
+String dayFileUrls[3];
+String dayFileText[3];
+String dayFileStatus[3];
+String dayFileDate;
 bool naptEnabled = false;
 String condition = "";
 String weatherDescription = "";
@@ -48,6 +53,16 @@ uint32_t lastWeatherMs = 0;
 uint32_t lastDrawMs = 0;
 uint32_t bootPressMs = 0;
 int lastMinuteDrawn = -1;
+bool dailyFilesReady = false;
+bool dailyFetchHadError = false;
+bool cycleStarted = false;
+bool showingWeather = true;
+uint8_t currentDayCard = 0;
+uint32_t lastDailyFetchMs = 0;
+uint32_t nextScreenChangeMs = 0;
+static constexpr uint32_t DAY_CARD_MS = 5000;
+static constexpr uint32_t WEATHER_CARD_MS = 30000;
+static constexpr uint32_t DAILY_RETRY_MS = 10UL * 60UL * 1000UL;
 
 int timezoneOffsetHours(const String &zone) {
   if (zone.startsWith("UTC")) return zone.substring(3).toInt();
@@ -419,6 +434,167 @@ String dateString(const struct tm &t) {
   return String(buf);
 }
 
+template <typename ClientType>
+bool fetchDayLinesWithClient(ClientType &client, const String &url,
+                             const String &dayMonth, String &result) {
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return false;
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Day file HTTP %d: %s\n", code, url.c_str());
+    http.end();
+    return false;
+  }
+
+  Stream *stream = http.getStreamPtr();
+  const uint32_t started = millis();
+  const int contentLength = http.getSize();
+  size_t bytesRead = 0;
+  size_t captured = 0;
+  while ((contentLength >= 0
+            ? bytesRead < static_cast<size_t>(contentLength)
+            : (http.connected() || stream->available())) &&
+         millis() - started < 15000) {
+    if (!stream->available()) {
+      delay(1);
+      continue;
+    }
+    String line = stream->readStringUntil('\n');
+    bytesRead += line.length() + 1;
+    line.trim();
+    if (captured == 0 && line.startsWith("\xEF\xBB\xBF")) line.remove(0, 3);
+    if (line.startsWith(dayMonth) && line.length() > 5 && line[5] == ' ') {
+      String entry = line.substring(5);
+      entry.trim();
+      if (entry.startsWith("—")) {
+        entry.remove(0, String("—").length());
+        entry.trim();
+      }
+      if (!entry.isEmpty()) {
+        if (!result.isEmpty()) result += '\n';
+        result += entry;
+        captured += entry.length();
+        if (captured > 2200) {
+          result += "\n…";
+          break;
+        }
+      }
+    }
+  }
+  http.end();
+  return true;
+}
+
+bool fetchDayLines(const String &url, const String &dayMonth, String &result) {
+  if (url.startsWith("https://")) {
+    WiFiClientSecure client;
+    // URLs are user-supplied, so no single CA certificate can be preconfigured.
+    // The source files are public text; HTTPS still encrypts the connection.
+    client.setInsecure();
+    return fetchDayLinesWithClient(client, url, dayMonth, result);
+  }
+  if (url.startsWith("http://")) {
+    WiFiClient client;
+    return fetchDayLinesWithClient(client, url, dayMonth, result);
+  }
+  return false;
+}
+
+void drawWrappedText(const String &text, int16_t x, int16_t firstBaseline,
+                     int16_t maxBaseline, uint16_t color) {
+  const int16_t maxWidth = 296;
+  int16_t y = firstBaseline;
+  String line;
+  String word;
+  bool clipped = false;
+  auto flushLine = [&]() {
+    if (line.isEmpty()) return;
+    if (y > maxBaseline) { clipped = true; return; }
+    drawUtf8(line, x, y, color);
+    y += 16;
+    line = "";
+  };
+
+  for (size_t i = 0; i <= text.length(); ++i) {
+    const char c = i < text.length() ? text[i] : '\n';
+    if (c != ' ' && c != '\n' && c != '\r') {
+      word += c;
+      continue;
+    }
+    if (!word.isEmpty()) {
+      const String candidate = line.isEmpty() ? word : line + " " + word;
+      if (u8g2.getUTF8Width(candidate.c_str()) > maxWidth && !line.isEmpty()) {
+        flushLine();
+      }
+      if (clipped) break;
+      if (!line.isEmpty()) line += ' ';
+      line += word;
+      word = "";
+    }
+    if (c == '\n' || i == text.length()) flushLine();
+    if (clipped) break;
+  }
+  if (clipped && y <= maxBaseline) drawUtf8("… продолжение", x, y, TFT_LIGHTGREY);
+}
+
+void drawDayCard(uint8_t index) {
+  static const char *titles[] = {
+    "ЭТОТ ДЕНЬ В ИСТОРИИ", "ПРАЗДНИКИ РОССИИ", "ПРАЗДНИКИ МИРА"
+  };
+  tft.fillScreen(0x0841);
+  tft.fillRect(0, 0, 320, 38, 0x10A3);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_YELLOW, 0x10A3);
+  tft.drawString(dayFileDate, 12, 8, 4);
+  drawUtf8(titles[index], 92, 25, TFT_WHITE);
+  tft.drawFastHLine(12, 48, 296, 0x39E7);
+  const String body = dayFileText[index].isEmpty()
+    ? (dayFileUrls[index].isEmpty() ? "Укажите ссылку на файл в настройках." : "На эту дату записей нет.")
+    : dayFileText[index];
+  drawWrappedText(body, 12, 72, 220, TFT_WHITE);
+  drawUtf8Centered(String(index + 1) + " / 3", 160, 237, TFT_DARKGREY);
+}
+
+void updateDailyFiles() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  struct tm now;
+  if (!getLocalTimeSafe(now)) return;
+  char dateKey[6];
+  snprintf(dateKey, sizeof(dateKey), "%02d.%02d", now.tm_mday, now.tm_mon + 1);
+  const String today(dateKey);
+  const bool newDate = today != dayFileDate;
+  if (!newDate && dailyFilesReady && !dailyFetchHadError) return;
+  if (!newDate && millis() - lastDailyFetchMs < DAILY_RETRY_MS) return;
+
+  dayFileDate = today;
+  dailyFilesReady = false;
+  dailyFetchHadError = false;
+  for (uint8_t i = 0; i < 3; ++i) {
+    dayFileText[i] = "";
+    if (dayFileUrls[i].isEmpty()) {
+      dayFileStatus[i] = "URL не задан";
+      continue;
+    }
+    const bool ok = fetchDayLines(dayFileUrls[i], today, dayFileText[i]);
+    if (!ok) {
+      dayFileStatus[i] = "Ошибка загрузки";
+      dailyFetchHadError = true;
+    } else {
+      dayFileStatus[i] = dayFileText[i].isEmpty() ? "Записей на дату нет" : "Загружен";
+    }
+    Serial.printf("Day file %u (%s): %s\n", i + 1, today.c_str(), dayFileStatus[i].c_str());
+  }
+  lastDailyFetchMs = millis();
+  dailyFilesReady = true;
+  if (newDate || !cycleStarted) {
+    cycleStarted = false;
+    showingWeather = false;
+    currentDayCard = 0;
+  }
+}
+
 String settingsPage() {
   String html = F("<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>CYD Weather</title><style>body{font:16px system-ui;background:#101827;color:#edf3ff;max-width:520px;margin:24px auto;padding:0 16px}"
@@ -438,6 +614,13 @@ String settingsPage() {
   html += htmlEscape(cityName);
   html += F("'><label>Часовой пояс (UTC±N; Красноярск — UTC+7)</label><input name=timezone maxlength=16 value='");
   html += normalizedTimezoneInput(timezoneName);
+  html += F("'><h2>Тексты на сегодня</h2><p>Укажите прямые ссылки на TXT-файлы. В каждой строке дата должна начинаться в формате ДД.ММ — текст.</p>");
+  html += F("<label>Файл 1 — этот день в истории (URL)</label><input name=day_url_1 type=url maxlength=255 value='");
+  html += htmlEscape(dayFileUrls[0]);
+  html += F("'><label>Файл 2 — праздники России (URL)</label><input name=day_url_2 type=url maxlength=255 value='");
+  html += htmlEscape(dayFileUrls[1]);
+  html += F("'><label>Файл 3 — праздники мира (URL)</label><input name=day_url_3 type=url maxlength=255 value='");
+  html += htmlEscape(dayFileUrls[2]);
   html += F("'><button type=submit>Сохранить и перезапустить</button></form><a href='/'>Статус</a></main></html>");
   return html;
 }
@@ -484,6 +667,9 @@ void beginWebServer() {
     const String requestedApPassword = server.arg("ap_password");
     const String city = server.arg("city");
     String tz = server.arg("timezone");
+    const String dayUrl1 = server.arg("day_url_1");
+    const String dayUrl2 = server.arg("day_url_2");
+    const String dayUrl3 = server.arg("day_url_3");
     if ((portalMode && ssid.isEmpty()) || city.isEmpty() ||
         (!requestedApSsid.isEmpty() && requestedApPassword.length() > 0 && requestedApPassword.length() < 8)) {
       server.send(400, "text/plain; charset=utf-8", "Заполните Wi-Fi и город.");
@@ -497,6 +683,9 @@ void beginWebServer() {
       else if (networkChanged) savedPassword = "";
     }
     cityName = city;
+    if (server.hasArg("day_url_1")) dayFileUrls[0] = dayUrl1;
+    if (server.hasArg("day_url_2")) dayFileUrls[1] = dayUrl2;
+    if (server.hasArg("day_url_3")) dayFileUrls[2] = dayUrl3;
     if (!requestedApSsid.isEmpty()) apName = requestedApSsid;
     if (requestedApPassword.length() >= 8) apPassword = requestedApPassword;
     if (!tz.isEmpty()) timezoneName = tz;
@@ -509,6 +698,9 @@ void beginWebServer() {
     prefs.putString("timezone", timezoneName);
     prefs.putString("ap_ssid", apName);
     prefs.putString("ap_password", apPassword);
+    prefs.putString("day_url_1", dayFileUrls[0]);
+    prefs.putString("day_url_2", dayFileUrls[1]);
+    prefs.putString("day_url_3", dayFileUrls[2]);
     prefs.end();
     server.send(200, "text/html; charset=utf-8",
       "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><body style='font:18px system-ui;background:#101827;color:white;padding:24px'><h2>Настройки сохранены</h2><p>Плата перезапустится.</p></body>");
@@ -614,6 +806,9 @@ void setup() {
   timezoneName = prefs.getString("timezone", "UTC+7");
   apName = prefs.getString("ap_ssid", "");
   apPassword = prefs.getString("ap_password", SETTINGS_AP_PASSWORD);
+  dayFileUrls[0] = prefs.getString("day_url_1", "");
+  dayFileUrls[1] = prefs.getString("day_url_2", "");
+  dayFileUrls[2] = prefs.getString("day_url_3", "");
   prefs.end();
 
   if (!connectWifi()) {
@@ -650,12 +845,39 @@ void loop() {
   } else if (!naptEnabled) {
     enableNapt();
   }
+  updateDailyFiles();
+  if (dailyFilesReady && !cycleStarted) {
+    cycleStarted = true;
+    showingWeather = false;
+    currentDayCard = 0;
+    drawDayCard(currentDayCard);
+    nextScreenChangeMs = millis() + DAY_CARD_MS;
+  }
+
   const uint32_t refreshAfter = weatherReady ? WEATHER_INTERVAL_MS : WEATHER_RETRY_MS;
   if (millis() - lastWeatherMs >= refreshAfter) {
-    if (fetchWeather()) drawDashboard(true);
-    else if (!weatherReady) drawDashboard(true);
+    if (fetchWeather() && showingWeather) drawDashboard(true);
+    else if (!weatherReady && showingWeather) drawDashboard(true);
   }
-  drawDashboard(false);
+  if (cycleStarted && static_cast<int32_t>(millis() - nextScreenChangeMs) >= 0) {
+    if (!showingWeather) {
+      if (currentDayCard < 2) {
+        ++currentDayCard;
+        drawDayCard(currentDayCard);
+        nextScreenChangeMs = millis() + DAY_CARD_MS;
+      } else {
+        showingWeather = true;
+        drawDashboard(true);
+        nextScreenChangeMs = millis() + WEATHER_CARD_MS;
+      }
+    } else {
+      showingWeather = false;
+      currentDayCard = 0;
+      drawDayCard(currentDayCard);
+      nextScreenChangeMs = millis() + DAY_CARD_MS;
+    }
+  }
+  if (showingWeather) drawDashboard(false);
   delay(100);
 }
 
