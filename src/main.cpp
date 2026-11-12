@@ -10,6 +10,7 @@
 #include <esp_netif.h>
 #include <esp_wifi.h>
 #include <WiFiClientSecure.h>
+#include <vector>
 
 // Target: ESP32-2432S028 CYD, matching the working NerdMiner ILI9341_2 setup.
 // The display is driven by TFT_eSPI; touch is not needed for this dashboard.
@@ -60,7 +61,11 @@ bool showingWeather = true;
 uint8_t currentDayCard = 0;
 uint32_t lastDailyFetchMs = 0;
 uint32_t nextScreenChangeMs = 0;
-static constexpr uint32_t DAY_CARD_MS = 5000;
+uint32_t lastHistoryScrollMs = 0;
+std::vector<String> dayCardLines[3];
+int16_t dayScrollOffset[3] = {0, 0, 0};
+int16_t dayScrollMax[3] = {0, 0, 0};
+static constexpr uint32_t DAY_CARD_MS = 10000;
 static constexpr uint32_t WEATHER_CARD_MS = 30000;
 static constexpr uint32_t DAILY_RETRY_MS = 10UL * 60UL * 1000UL;
 
@@ -105,6 +110,14 @@ void drawUtf8Centered(const String &text, int16_t centerX, int16_t baseline, uin
   u8g2.setFont(u8g2_font_6x13_t_cyrillic);
   const int16_t width = u8g2.getUTF8Width(text.c_str());
   drawUtf8(text, centerX - width / 2, baseline, color);
+}
+
+void drawLargeUtf8(const String &text, int16_t x, int16_t baseline, uint16_t color) {
+  u8g2.setFont(u8g2_font_10x20_t_cyrillic);
+  u8g2.setFontMode(1);
+  u8g2.setFontDirection(0);
+  u8g2.setForegroundColor(color);
+  u8g2.drawUTF8(x, baseline, text.c_str());
 }
 
 static const char PAGE[] PROGMEM = R"HTML(
@@ -502,18 +515,14 @@ bool fetchDayLines(const String &url, const String &dayMonth, String &result) {
   return false;
 }
 
-void drawWrappedText(const String &text, int16_t x, int16_t firstBaseline,
-                     int16_t maxBaseline, uint16_t color) {
-  const int16_t maxWidth = 296;
-  int16_t y = firstBaseline;
+void buildDayCardLines(uint8_t index, const String &text) {
+  dayCardLines[index].clear();
+  u8g2.setFont(u8g2_font_10x20_t_cyrillic);
+  const int16_t maxWidth = 280;
   String line;
   String word;
-  bool clipped = false;
   auto flushLine = [&]() {
-    if (line.isEmpty()) return;
-    if (y > maxBaseline) { clipped = true; return; }
-    drawUtf8(line, x, y, color);
-    y += 16;
+    if (!line.isEmpty()) dayCardLines[index].push_back(line);
     line = "";
   };
 
@@ -525,18 +534,31 @@ void drawWrappedText(const String &text, int16_t x, int16_t firstBaseline,
     }
     if (!word.isEmpty()) {
       const String candidate = line.isEmpty() ? word : line + " " + word;
-      if (u8g2.getUTF8Width(candidate.c_str()) > maxWidth && !line.isEmpty()) {
-        flushLine();
-      }
-      if (clipped) break;
+      if (u8g2.getUTF8Width(candidate.c_str()) > maxWidth && !line.isEmpty()) flushLine();
       if (!line.isEmpty()) line += ' ';
       line += word;
       word = "";
     }
     if (c == '\n' || i == text.length()) flushLine();
-    if (clipped) break;
   }
-  if (clipped && y <= maxBaseline) drawUtf8("… продолжение", x, y, TFT_LIGHTGREY);
+  // Six rows fit in the viewport. Keep the per-card offset between cycles so
+  // long entries continue scrolling next time instead of restarting at the top.
+  dayScrollMax[index] = dayCardLines[index].size() > 6
+    ? static_cast<int16_t>((dayCardLines[index].size() - 6) * 26)
+    : 0;
+  if (dayScrollOffset[index] > dayScrollMax[index]) dayScrollOffset[index] = 0;
+}
+
+void drawDayCardText(uint8_t index) {
+  const uint16_t background = 0x0841;
+  tft.fillRect(12, 54, 296, 170, background);
+  tft.setViewport(12, 54, 296, 170, true);
+  for (size_t i = 0; i < dayCardLines[index].size(); ++i) {
+    const int16_t baseline = 24 + static_cast<int16_t>(i * 26) - dayScrollOffset[index];
+    if (baseline < -20 || baseline > 190) continue;
+    drawLargeUtf8(dayCardLines[index][i], 2, baseline, TFT_WHITE);
+  }
+  tft.resetViewport();
 }
 
 void drawDayCard(uint8_t index) {
@@ -553,7 +575,8 @@ void drawDayCard(uint8_t index) {
   const String body = dayFileText[index].isEmpty()
     ? (dayFileUrls[index].isEmpty() ? "Укажите ссылку на файл в настройках." : "На эту дату записей нет.")
     : dayFileText[index];
-  drawWrappedText(body, 12, 72, 220, TFT_WHITE);
+  if (dayCardLines[index].empty()) buildDayCardLines(index, body);
+  drawDayCardText(index);
   drawUtf8Centered(String(index + 1) + " / 3", 160, 237, TFT_DARKGREY);
 }
 
@@ -569,8 +592,16 @@ void updateDailyFiles() {
   if (!newDate && millis() - lastDailyFetchMs < DAILY_RETRY_MS) return;
 
   dayFileDate = today;
+  if (newDate) {
+    for (uint8_t i = 0; i < 3; ++i) {
+      dayScrollOffset[i] = 0;
+      dayScrollMax[i] = 0;
+      dayCardLines[i].clear();
+    }
+  }
   dailyFilesReady = false;
   dailyFetchHadError = false;
+  for (uint8_t i = 0; i < 3; ++i) dayCardLines[i].clear();
   for (uint8_t i = 0; i < 3; ++i) {
     dayFileText[i] = "";
     if (dayFileUrls[i].isEmpty()) {
@@ -851,6 +882,7 @@ void loop() {
     showingWeather = false;
     currentDayCard = 0;
     drawDayCard(currentDayCard);
+    lastHistoryScrollMs = millis();
     nextScreenChangeMs = millis() + DAY_CARD_MS;
   }
 
@@ -864,8 +896,11 @@ void loop() {
       if (currentDayCard < 2) {
         ++currentDayCard;
         drawDayCard(currentDayCard);
+        lastHistoryScrollMs = millis();
         nextScreenChangeMs = millis() + DAY_CARD_MS;
       } else {
+        if (dayScrollOffset[currentDayCard] >= dayScrollMax[currentDayCard])
+          dayScrollOffset[currentDayCard] = 0;
         showingWeather = true;
         drawDashboard(true);
         nextScreenChangeMs = millis() + WEATHER_CARD_MS;
@@ -874,8 +909,16 @@ void loop() {
       showingWeather = false;
       currentDayCard = 0;
       drawDayCard(currentDayCard);
+      lastHistoryScrollMs = millis();
       nextScreenChangeMs = millis() + DAY_CARD_MS;
     }
+  }
+  if (cycleStarted && !showingWeather &&
+      dayScrollOffset[currentDayCard] < dayScrollMax[currentDayCard] &&
+      millis() - lastHistoryScrollMs >= 80) {
+    ++dayScrollOffset[currentDayCard];
+    lastHistoryScrollMs = millis();
+    drawDayCardText(currentDayCard);
   }
   if (showingWeather) drawDashboard(false);
   delay(100);
